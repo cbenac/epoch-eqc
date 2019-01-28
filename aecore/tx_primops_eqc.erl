@@ -80,12 +80,11 @@ mine(Height) ->
 mine_next(#{tx_env := TxEnv} = S, _Value, [H]) ->
     S#{tx_env => aetx_env:set_height(TxEnv, H + 1)}.
 
-
 %% --- Operation: spend ---
 spend_pre(S) ->
     maps:is_key(accounts, S).
 
-spend_args(#{accounts := Accounts, tx_env := Env}) ->
+spend_args(#{accounts := Accounts, tx_env := Env} = S) ->
     ?LET(Args, 
     ?LET([{SenderTag, Sender}, {ReceiverTag, Receiver}], 
          vector(2, gen_account_pubkey(Accounts)),
@@ -127,7 +126,7 @@ spend_valid(Accounts, [{_, Sender}, Tx]) ->
 spend(Env, _Sender, _Receiver, Tx, _Correct) ->
     Trees = get(trees),
     {ok, AeTx} = rpc(aec_spend_tx, new, [Tx]),
-    {_CB, SpendTx} = aetx:specialize_callback(AeTx),
+    {_, SpendTx} = aetx:specialize_type(AeTx),
 
     %% old version
     Remote = 
@@ -139,7 +138,7 @@ spend(Env, _Sender, _Receiver, Tx, _Correct) ->
         end,
 
     Local = rpc:call(node(), aec_spend_tx, process, [SpendTx, Trees, Env], 1000),
-    case eq_rpc(Local, Remote, fun hash_equal/2) of
+    case catch eq_rpc(Local, Remote, fun hash_equal/2) of
         {ok, NewTrees} ->
             put(trees, NewTrees),
             ok;
@@ -177,8 +176,15 @@ spend_next(#{accounts := Accounts} = S, _Value,
 
 spend_post(_S, [_Env, _, _, _Tx, Correct], Res) ->
     case Res of
-        {error, _} when Correct -> false;
-        _ -> true
+        {error, _} -> not Correct;
+        ok -> Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_low},
+          {error, insufficient_funds}}} -> not Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_high},
+          {error, insufficient_funds}}} -> not Correct;
+        _ -> false
     end.
 
 
