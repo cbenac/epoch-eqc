@@ -190,11 +190,11 @@ spend_post(_S, [_Env, _, _, _Tx, Correct], Res) ->
 
 spend_features(S, [_Env, {_, Sender}, {_, Receiver}, Tx, Correct], Res) ->
     [{spend_accounts, length(maps:get(accounts, S))}, 
-     {spend_correct, Correct}] ++
+     {correct,  if Correct -> spend; true -> false end}] ++
         [ spend_to_self || Sender == Receiver andalso Correct] ++
              [ {spend, zero} || maps:get(amount, Tx) == 0 andalso Correct] ++
              [ {spend, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
-        [{spend_error, Res} || is_tuple(Res) andalso element(1, Res) == error].
+        [{spend, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
 
 %% --- Operation: register_oracle ---
@@ -278,10 +278,10 @@ register_oracle_post(_S, [_Env, _Sender, _Tx, Correct], Res) ->
     end.
 
 register_oracle_features(S, [_Env, {_, Sender}, Tx, Correct], Res) ->
-    [{register_oracle_correct, Correct}] ++
+    [{correct, if Correct -> register_oracle; true -> false end} ] ++
              [ {oracle_query_fee, zero} || maps:get(query_fee, Tx) == 0 andalso Correct] ++
              [ {oracle, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
-        [{register_oracle_error, Res} || is_tuple(Res) andalso element(1, Res) == error].
+        [{register_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
 %% -- Property ---------------------------------------------------------------
 prop_tx_primops() ->
