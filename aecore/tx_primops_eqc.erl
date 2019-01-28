@@ -197,7 +197,91 @@ spend_features(S, [_Env, {_, Sender}, {_, Receiver}, Tx, Correct], Res) ->
         [{spend_error, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
 
+%% --- Operation: register_oracle ---
+register_oracle_pre(S) ->
+    length(maps:get(accounts, S, [])) > 1.
 
+register_oracle_args(#{accounts := Accounts, tx_env := Env} = S) ->
+    ?LET(Args, 
+         ?LET({SenderTag, Sender}, gen_account_pubkey(lists:keydelete(?Patron, #account.key, Accounts)),
+              ?LET([Amount, Nonce], [nat(), oneof([0, 1, Sender#account.nonce, 100])],
+                   [Env, {SenderTag, Sender#account.key},
+                    #{account_id => aec_id:create(account, Sender#account.key), 
+                      query_format    => <<"{foo: bar}"/utf8>>,
+                      response_format => <<"boolean()"/utf8>>,
+                      query_fee       => Amount,
+                      fee => choose(1, 10), 
+                      nonce => Nonce,
+                      oracle_ttl => {delta, 100}}])),
+         Args ++ [register_oracle_valid(S, [lists:nth(2, Args), lists:last(Args)])]).
+
+register_oracle_pre(S, [_Env, Sender, Tx, Correct]) ->
+    %% Sender /= ?Patron andalso
+    Correct == register_oracle_valid(S, [Sender, Tx]).
+
+register_oracle_valid(S, [{_, Sender}, Tx]) ->
+    case lists:keyfind(Sender, #account.key, maps:get(accounts, S, [])) of
+        false -> false;
+        SenderAccount ->
+            SenderAccount#account.nonce == maps:get(nonce, Tx) andalso
+                SenderAccount#account.amount >= maps:get(fee, Tx) andalso
+                not lists:member(Sender, maps:get(oracles, S, []))
+    end.
+
+register_oracle(Env, Sender, Tx, Correct) ->
+    Trees = get(trees),
+    {ok, AeTx} = rpc(aeo_register_tx, new, [Tx]),
+    {oracle_register_tx, OracleTx} = aetx:specialize_type(AeTx),
+    
+    %% old version
+    Remote = 
+        case rpc:call(?REMOTE_NODE,aeo_register_tx, check, [OracleTx, Trees, Env], 1000) of
+            {ok, Ts} ->
+                rpc:call(?REMOTE_NODE, aeo_register_tx, process, [OracleTx, Ts, Env], 1000);
+            OldError ->
+                OldError
+        end,
+
+    Local = rpc:call(node(), aeo_register_tx, process, [OracleTx, Trees, Env], 1000),
+    case catch eq_rpc(Local, Remote, fun hash_equal/2) of
+        {ok, NewTrees} ->
+            put(trees, NewTrees),
+            ok;
+        Other -> Other
+    end.
+    
+
+register_oracle_next(#{accounts := Accounts} = S, _Value, [_Env, {_, Sender}, Tx, Correct]) ->
+    if Correct ->
+            SAccount = lists:keyfind(Sender, #account.key, Accounts),
+            S#{accounts => 
+                   (Accounts -- [SAccount]) ++
+                   [SAccount#account{amount = SAccount#account.amount - maps:get(fee, Tx), 
+                                     nonce = maps:get(nonce, Tx) + 1}],
+               oracles =>
+                   maps:get(oracles, S, []) ++ [Sender]};
+       not Correct -> 
+            S
+    end.
+
+register_oracle_post(_S, [_Env, _Sender, _Tx, Correct], Res) ->
+    case Res of
+        {error, _} -> not Correct;
+        ok -> Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_low},
+          {error, insufficient_funds}}} -> not Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_high},
+          {error, insufficient_funds}}} -> not Correct;
+        _ -> false
+    end.
+
+register_oracle_features(S, [_Env, {_, Sender}, Tx, Correct], Res) ->
+    [{register_oracle_correct, Correct}] ++
+             [ {oracle_query_fee, zero} || maps:get(query_fee, Tx) == 0 andalso Correct] ++
+             [ {oracle, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
+        [{register_oracle_error, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
 %% -- Property ---------------------------------------------------------------
 prop_tx_primops() ->
