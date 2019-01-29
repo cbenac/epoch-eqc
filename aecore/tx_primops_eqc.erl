@@ -198,13 +198,7 @@ spend_post(_S, [_Env, _, _, _Tx, Correct], Res) ->
     case Res of
         {error, _} -> not Correct;
         ok -> Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_low},
-          {error, insufficient_funds}}} -> not Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_high},
-          {error, insufficient_funds}}} -> not Correct;
-        _ -> false
+        _ -> not Correct andalso valid_mismatch(Res)
     end.
 
 
@@ -292,13 +286,7 @@ register_oracle_post(_S, [_Env, _Sender,_Tx, Correct], Res) ->
     case Res of
         {error, _} -> not Correct;
         ok -> Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_low},
-          {error, insufficient_funds}}} -> not Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_high},
-          {error, insufficient_funds}}} -> not Correct;
-        _ -> false
+        _ -> not Correct andalso valid_mismatch(Res)
     end.
 
 register_oracle_features(_S, [_Env, {_, _Sender}, Tx, Correct], Res) ->
@@ -393,13 +381,7 @@ query_oracle_post(_S, [_Env, _Sender, _Oracle, _Tx, Correct], Res) ->
      case Res of
         {error, _} -> not Correct;
         ok -> Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_low},
-          {error, insufficient_funds}}} -> not Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_high},
-          {error, insufficient_funds}}} -> not Correct;
-        _ -> false
+         _ -> not Correct andalso valid_mismatch(Res)
     end.
 
 query_oracle_features(_S, [_Env, _, _, Tx, Correct], Res) ->
@@ -489,13 +471,7 @@ response_oracle_post(_S, [_Env, _Oracle, _Tx, Correct], Res) ->
     case Res of
         {error, _} -> not Correct;
         ok -> Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_low},
-          {error, insufficient_funds}}} -> not Correct;
-        {'EXIT',
-         {different, {error, account_nonce_too_high},
-          {error, insufficient_funds}}} -> not Correct;
-        _ -> false
+        _ -> not Correct andalso valid_mismatch(Res)
     end.
 
 response_oracle_features(_S, [_Env, _, _Tx, Correct], Res) ->
@@ -571,7 +547,13 @@ eq_rpc(Local, Remote, InterpretResult) ->
         _ ->
             InterpretResult(Local, Remote)
     end.
-    
+
+
+valid_mismatch({'EXIT',{different, {error, account_nonce_too_low},
+                        {error, insufficient_funds}}}) -> true;
+valid_mismatch({'EXIT', {different, {error, account_nonce_too_high},
+                         {error, insufficient_funds}}}) -> true;
+valid_mismatch(_) -> false.
 %% -- Generators -------------------------------------------------------------
 
 
