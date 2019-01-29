@@ -19,6 +19,7 @@
 -define(Patron, <<1, 1, 0:240>>).
 
 -record(account, {key, amount, nonce}).
+-record(query, {sender, id, fee, response_ttl}).
 
 %% -- State and state functions ----------------------------------------------
 initial_state() ->
@@ -84,15 +85,20 @@ mine(Height) ->
     ok.
 
 mine_next(#{tx_env := TxEnv} = S, _Value, [H]) ->
-    Payback = [ {Sender, Height, Fee} || {Sender, Height, Fee} <- maps:get(queries, S, []), Height =< H],
-    Accounts = [ case lists:keyfind(Account#account.key, 1, Payback) of
+    Payback = [ Query || Query <- maps:get(queries, S, []), Query#query.response_ttl =< H],
+    Accounts = [ case lists:keyfind(Account#account.key, #query.sender, Payback) of
                      false -> Account;
-                     {_, _, Fee} -> Account#account{amount = Account#account.amount + Fee}
+                     Query -> Account#account{amount = Account#account.amount + Query#query.fee}
                  end || Account <- maps:get(accounts, S, [])],
     S#{tx_env => aetx_env:set_height(TxEnv, H + 1),
        accounts => Accounts,
        queries =>  maps:get(queries, S, []) -- Payback
       }.
+
+mine_features(S, [H], _Res) ->
+    [mine_response_ttl || [ true || Query <- maps:get(queries, S, []), Query#query.response_ttl =< H ] =/= [] ] ++
+        [mine].
+
 
 %% --- Operation: spend ---
 spend_pre(S) ->
@@ -365,7 +371,7 @@ query_oracle(Env, _Sender, _Oracle, Tx, _Correct) ->
         Other -> Other
     end.
 
-query_oracle_next(#{accounts := Accounts} = S, _Value, [Env, {_, Sender}, _Oracle, Tx, Correct]) ->
+query_oracle_next(#{accounts := Accounts} = S, _Value, [Env, {_, Sender}, Oracle, Tx, Correct]) ->
     if Correct ->
             {delta, Delta} = maps:get(response_ttl, Tx),
             SAccount = lists:keyfind(Sender, #account.key, Accounts),
@@ -375,7 +381,10 @@ query_oracle_next(#{accounts := Accounts} = S, _Value, [Env, {_, Sender}, _Oracl
                       amount = SAccount#account.amount - maps:get(fee, Tx) - maps:get(query_fee, Tx), 
                       nonce = maps:get(nonce, Tx) + 1}],
               queries => maps:get(queries, S, []) ++
-                   [{Sender, Delta + aetx_env:height(Env), maps:get(query_fee, Tx)}]};
+                   [#query{sender = Sender, 
+                           id = {Sender, maps:get(nonce, Tx), Oracle}, 
+                           response_ttl = Delta + aetx_env:height(Env), 
+                           fee = maps:get(query_fee, Tx)}]};
        not Correct -> 
             S
     end.
@@ -399,9 +408,104 @@ query_oracle_features(_S, [_Env, _, _, Tx, Correct], Res) ->
              [ {query_oracle, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
         [{query_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
+%% --- Operation: response_oracle ---
+response_oracle_pre(S) ->
+     maps:get(queries, S, []) =/= [].
+
+%% Only responses to existing query tested for the moment, no fault injection
+response_oracle_args(#{accounts := Accounts, tx_env := Env} = S) ->
+    ?LET(Args, 
+         ?LET({Sender, Nonce, Oracle}, 
+               frequency([{99, ?LET(Query, elements(maps:get(queries, S)), Query#query.id)},
+                          {1, {?Patron, 2, ?Patron}}]),
+              [Env, {Sender, Nonce, Oracle},
+               #{oracle_id => aec_id:create(oracle, Oracle), 
+                 query_id => aeo_query:id(Sender, Nonce, Oracle),
+                 response => <<"yes, you can">>,
+                 response_ttl => {delta, 3},
+                 fee => choose(1, 10), 
+                 nonce => case lists:keyfind(Oracle, #account.key, Accounts) of
+                              false -> 1;
+                              Account -> Account#account.nonce
+                          end
+                }]),
+         Args ++ [response_oracle_valid(S, Args)]).
+
+response_oracle_pre(S, [Env, QueryId, Tx, Correct]) ->
+    Correct == response_oracle_valid(S, [Env, QueryId, Tx]) 
+        andalso correct_height(S, Env).
+
+response_oracle_valid(S, [_Env, {_, _, Oracle} = QueryId, Tx]) ->
+    case lists:keyfind(Oracle, #account.key, maps:get(accounts, S)) of
+        false -> false;
+        OracleAccount ->
+            Query = lists:keyfind(QueryId, #query.id, maps:get(queries, S, [])),
+            OracleAccount#account.nonce == maps:get(nonce, Tx) andalso
+                OracleAccount#account.amount >= maps:get(fee, Tx) andalso 
+                Query =/= false
+    end.
+
+response_oracle(Env, _QueryId, Tx, _Correct) ->
+    Trees = get(trees),
+    {ok, AeTx} = rpc(aeo_response_tx, new, [Tx]),
+    {oracle_response_tx, OracleTx} = aetx:specialize_type(AeTx),
+    
+    %% old version
+    Remote = 
+        case rpc:call(?REMOTE_NODE,aeo_response_tx, check, [OracleTx, Trees, Env], 1000) of
+            {ok, Ts} ->
+                rpc:call(?REMOTE_NODE, aeo_response_tx, process, [OracleTx, Ts, Env], 1000);
+            OldError ->
+                OldError
+        end,
+
+    Local = rpc:call(node(), aeo_response_tx, process, [OracleTx, Trees, Env], 1000),
+    case catch eq_rpc(Local, Remote, fun hash_equal/2) of
+        {ok, NewTrees} ->
+            put(trees, NewTrees),
+            ok;
+        Other -> Other
+    end.
+
+response_oracle_next(#{accounts := Accounts} = S, _Value, [_Env, QueryId, Tx, Correct]) ->
+    if Correct ->
+            {_, _, Oracle} = QueryId, 
+            OracleAccount = lists:keyfind(Oracle, #account.key, Accounts),
+            Query = lists:keyfind(QueryId, #query.id, maps:get(queries, S, [])),
+            QueryFee = Query#query.fee,
+            {delta, Delta} = maps:get(response_ttl, Tx),
+
+            S#{accounts => 
+                   (Accounts -- [OracleAccount]) ++
+                   [OracleAccount#account{
+                      amount = OracleAccount#account.amount - maps:get(fee, Tx) + QueryFee, 
+                      nonce = maps:get(nonce, Tx) + 1}],
+              queries => maps:get(queries, S, []) -- [Query]};
+       not Correct -> 
+            S
+    end.
+
+response_oracle_post(_S, [_Env, _Oracle, _Tx, Correct], Res) ->
+    case Res of
+        {error, _} -> not Correct;
+        ok -> Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_low},
+          {error, insufficient_funds}}} -> not Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_high},
+          {error, insufficient_funds}}} -> not Correct;
+        _ -> false
+    end.
+
+response_oracle_features(_S, [_Env, _, _Tx, Correct], Res) ->
+    [{correct, if Correct -> response_oracle; true -> false end} ] ++
+        [{response_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
+
 
 %% -- Property ---------------------------------------------------------------
 prop_tx_primops() ->
+    eqc:dont_print_counterexample(
     ?FORALL(Cmds, commands(?MODULE),
     begin
         pong = net_adm:ping(?REMOTE_NODE),
@@ -419,7 +523,7 @@ prop_tx_primops() ->
             aggregate(call_features(H),
                 pretty_commands(?MODULE, Cmds, {H, S, Res},
                                 Res == ok))))))
-    end).
+    end)).
 
 bugs() -> bugs(10).
 
