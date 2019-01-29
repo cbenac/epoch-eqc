@@ -56,7 +56,7 @@ init(_) ->
     ok.
 
 init_next(S, _Value, [TxEnv]) ->
-    S#{tx_env => TxEnv, 
+    S#{tx_env => TxEnv,
        accounts => [#account{key = ?Patron, amount = 1200000, nonce = 1}]}.
 
 %% --- Operation: mine ---
@@ -69,6 +69,12 @@ mine_args(#{tx_env := TxEnv}) ->
 
 mine_pre(#{tx_env := TxEnv}, [H]) ->
     aetx_env:height(TxEnv) == H.
+
+mine_adapt(#{tx_env := TxEnv}, [_]) ->
+    [aetx_env:height(TxEnv)];
+mine_adapt(_, _) ->
+    false.
+
 
 mine(Height) ->
     Trees = get(trees),
@@ -88,7 +94,7 @@ spend_args(#{accounts := Accounts, tx_env := Env} = S) ->
     ?LET(Args, 
     ?LET([{SenderTag, Sender}, {ReceiverTag, Receiver}], 
          vector(2, gen_account_pubkey(Accounts)),
-         ?LET([Amount, Nonce], [nat(), oneof([0, 1, Sender#account.nonce, 100])],
+         ?LET([Amount, Nonce], [nat(), gen_nonce(Sender)],
               [Env, {SenderTag, Sender#account.key}, {ReceiverTag, Receiver#account.key},
                #{sender_id => aec_id:create(account, Sender#account.key), 
                  recipient_id => aec_id:create(account, Receiver#account.key), 
@@ -96,18 +102,19 @@ spend_args(#{accounts := Accounts, tx_env := Env} = S) ->
                  fee => choose(1, 10), 
                  nonce => Nonce,
                  payload => utf8()}])),
-         Args ++ [spend_valid(Accounts, [lists:nth(2, Args), lists:last(Args)])]).
+         Args ++ [spend_valid(S, [Env, lists:nth(2, Args), lists:last(Args)])]).
 
-spend_pre(#{accounts := Accounts}, [_Env, Sender, {ReceiverTag, Receiver}, Tx, Correct]) ->
-    Valid = spend_valid(Accounts, [Sender, Tx]),
+spend_pre(#{accounts := Accounts} = S, [Env, {SenderTag, Sender}, {ReceiverTag, Receiver}, Tx, Correct]) ->
+    Valid = spend_valid(S, [Env, {SenderTag, Sender}, Tx]),
     ReceiverOk = 
         case ReceiverTag of 
             new -> lists:keyfind(Receiver, #account.key, Accounts) == false;
             existing -> lists:keyfind(Receiver, #account.key, Accounts) =/= false
         end,
-    ReceiverOk andalso Correct == Valid.
+    ReceiverOk andalso Correct == Valid
+        andalso correct_height(S, Env).
 
-spend_valid(Accounts, [{_, Sender}, Tx]) ->
+spend_valid(#{accounts := Accounts}, [_Env, {_, Sender}, Tx]) ->
     case lists:keyfind(Sender, #account.key, Accounts) of
         false -> false;
         SenderAccount ->
@@ -116,13 +123,12 @@ spend_valid(Accounts, [{_, Sender}, Tx]) ->
                 maps:get(fee, Tx) >= 0   %% it seems fee == 0 does not return error
     end.
 
+spend_adapt(#{tx_env := TxEnv} = S, [_, {SenderTag, Sender}, {ReceiverTag, Receiver}, Tx, _Correct]) ->
+    [TxEnv, {SenderTag, Sender}, {ReceiverTag, Receiver}, Tx, spend_valid(S, [TxEnv, {SenderTag, Sender}, Tx])];
+spend_adapt(_, _) ->
+    false.
 
-%% Don't get adapt to work! Needs investigation.
-%% spend_adapt(_S, [Env, Sender, Receiver, Tx, Correct]) ->
-%%     %% We only get here if spend is not Correct
-%%     [Env, Sender, Receiver, Tx, not Correct].
     
-
 spend(Env, _Sender, _Receiver, Tx, _Correct) ->
     Trees = get(trees),
     {ok, AeTx} = rpc(aec_spend_tx, new, [Tx]),
@@ -204,20 +210,18 @@ register_oracle_pre(S) ->
 register_oracle_args(#{accounts := Accounts, tx_env := Env} = S) ->
     ?LET(Args, 
          ?LET({SenderTag, Sender}, gen_account_pubkey(lists:keydelete(?Patron, #account.key, Accounts)),
-              ?LET([Amount, Nonce], [nat(), oneof([0, 1, Sender#account.nonce, 100])],
-                   [Env, {SenderTag, Sender#account.key},
+              [Env, {SenderTag, Sender#account.key},
                     #{account_id => aec_id:create(account, Sender#account.key), 
-                      query_format    => <<"{foo: bar}"/utf8>>,
+                      query_format    => <<"send me any string"/utf8>>,
                       response_format => <<"boolean()"/utf8>>,
-                      query_fee       => Amount,
+                      query_fee       => nat(),
                       fee => choose(1, 10), 
-                      nonce => Nonce,
-                      oracle_ttl => {delta, 100}}])),
+                      nonce => gen_nonce(Sender),
+                      oracle_ttl => {delta, 100}}]),
          Args ++ [register_oracle_valid(S, [lists:nth(2, Args), lists:last(Args)])]).
 
-register_oracle_pre(S, [_Env, Sender, Tx, Correct]) ->
-    %% Sender /= ?Patron andalso
-    Correct == register_oracle_valid(S, [Sender, Tx]).
+register_oracle_pre(S, [Env, Sender, Tx, Correct]) ->
+    Correct == register_oracle_valid(S, [Sender, Tx]) andalso correct_height(S, Env).
 
 register_oracle_valid(S, [{_, Sender}, Tx]) ->
     case lists:keyfind(Sender, #account.key, maps:get(accounts, S, [])) of
@@ -225,10 +229,16 @@ register_oracle_valid(S, [{_, Sender}, Tx]) ->
         SenderAccount ->
             SenderAccount#account.nonce == maps:get(nonce, Tx) andalso
                 SenderAccount#account.amount >= maps:get(fee, Tx) andalso
-                not lists:member(Sender, maps:get(oracles, S, []))
+                not lists:keymember(Sender, 1, maps:get(oracles, S, []))
     end.
 
-register_oracle(Env, Sender, Tx, Correct) ->
+register_oracle_adapt(#{tx_env := TxEnv} = S, [_, Sender, Tx, _Correct]) ->
+    [TxEnv, Sender, Tx, register_oracle_valid(S, [Sender, Tx])];
+register_oracle_adapt(_, _) ->
+    %% in case we don't even have a TxEnv
+    false.
+
+register_oracle(Env, _Sender, Tx, _Correct) ->
     Trees = get(trees),
     {ok, AeTx} = rpc(aeo_register_tx, new, [Tx]),
     {oracle_register_tx, OracleTx} = aetx:specialize_type(AeTx),
@@ -259,12 +269,12 @@ register_oracle_next(#{accounts := Accounts} = S, _Value, [_Env, {_, Sender}, Tx
                    [SAccount#account{amount = SAccount#account.amount - maps:get(fee, Tx), 
                                      nonce = maps:get(nonce, Tx) + 1}],
                oracles =>
-                   maps:get(oracles, S, []) ++ [Sender]};
+                   maps:get(oracles, S, []) ++ [{Sender, maps:get(query_fee, Tx)}]};
        not Correct -> 
             S
     end.
 
-register_oracle_post(_S, [_Env, _Sender, _Tx, Correct], Res) ->
+register_oracle_post(_S, [_Env, _Sender,_Tx, Correct], Res) ->
     case Res of
         {error, _} -> not Correct;
         ok -> Correct;
@@ -277,11 +287,106 @@ register_oracle_post(_S, [_Env, _Sender, _Tx, Correct], Res) ->
         _ -> false
     end.
 
-register_oracle_features(S, [_Env, {_, Sender}, Tx, Correct], Res) ->
+register_oracle_features(_S, [_Env, {_, _Sender}, Tx, Correct], Res) ->
     [{correct, if Correct -> register_oracle; true -> false end} ] ++
              [ {oracle_query_fee, zero} || maps:get(query_fee, Tx) == 0 andalso Correct] ++
              [ {oracle, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
         [{register_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
+
+
+%% --- Operation: query_oracle ---
+query_oracle_pre(S) ->
+     maps:is_key(accounts, S).
+
+query_oracle_args(#{accounts := Accounts, tx_env := Env} = S) ->
+    ?LET(Args, 
+         ?LET([{SenderTag, Sender}, {_, Oracle}], 
+              vector(2, gen_account_pubkey(Accounts)),
+                   [Env, {SenderTag, Sender#account.key}, Oracle#account.key,
+                    #{sender_id => aec_id:create(account, Sender#account.key), 
+                      oracle_id => aec_id:create(oracle, Oracle#account.key), 
+                      query => oneof([<<"{foo: bar}"/utf8>>, <<"any string"/utf8>>, <<>>]),
+                      query_fee => nat(),
+                      query_ttl => {delta, 3},
+                      response_ttl => {delta, 3},
+                      fee => choose(1, 10), 
+                      nonce => gen_nonce(Sender)
+                     }]),
+         Args ++ [query_oracle_valid(S, Args)]).
+
+query_oracle_pre(S, [Env, {SenderTag, Sender}, Oracle, Tx, Correct]) ->
+    Correct == query_oracle_valid(S, [Env, {SenderTag, Sender}, Oracle, Tx]) andalso correct_height(S, Env).
+
+query_oracle_valid(S, [_Env, {_SenderTag, Sender}, Oracle, Tx]) ->
+    case {lists:keyfind(Sender, #account.key, maps:get(accounts, S, [])),
+          lists:keyfind(Oracle, 1, maps:get(oracles, S, []))}
+          of
+        {false, _} -> false;
+        {_, false} -> false;
+        {SenderAccount, {_, QueryFee}} ->
+            SenderAccount#account.nonce == maps:get(nonce, Tx) andalso
+                SenderAccount#account.amount >= maps:get(fee, Tx) + maps:get(query_fee, Tx) andalso
+                maps:get(query_fee, Tx) >= QueryFee
+    end.
+
+query_oracle_adapt(#{tx_env := TxEnv} = S, [_Env, Sender, Oracle, Tx, _Correct]) ->
+    [TxEnv, Sender, Oracle, Tx, query_oracle_valid(S, [TxEnv, Sender, Oracle, Tx])];
+query_oracle_adapt(_, _) ->
+    false.
+
+
+query_oracle(Env, _Sender, _Oracle, Tx, _Correct) ->
+    Trees = get(trees),
+    {ok, AeTx} = rpc(aeo_query_tx, new, [Tx]),
+    {oracle_query_tx, OracleTx} = aetx:specialize_type(AeTx),
+    
+    %% old version
+    Remote = 
+        case rpc:call(?REMOTE_NODE,aeo_query_tx, check, [OracleTx, Trees, Env], 1000) of
+            {ok, Ts} ->
+                rpc:call(?REMOTE_NODE, aeo_query_tx, process, [OracleTx, Ts, Env], 1000);
+            OldError ->
+                OldError
+        end,
+
+    Local = rpc:call(node(), aeo_query_tx, process, [OracleTx, Trees, Env], 1000),
+    case catch eq_rpc(Local, Remote, fun hash_equal/2) of
+        {ok, NewTrees} ->
+            put(trees, NewTrees),
+            ok;
+        Other -> Other
+    end.
+
+query_oracle_next(#{accounts := Accounts} = S, _Value, [_Env, {_, Sender}, _Oracle, Tx, Correct]) ->
+    if Correct ->
+            SAccount = lists:keyfind(Sender, #account.key, Accounts),
+            S#{accounts => 
+                   (Accounts -- [SAccount]) ++
+                   [SAccount#account{amount = SAccount#account.amount - maps:get(fee, Tx) - maps:get(query_fee, Tx), 
+                                     nonce = maps:get(nonce, Tx) + 1}]};
+       not Correct -> 
+            S
+    end.
+
+query_oracle_post(_S, [_Env, _Sender, _Oracle, _Tx, Correct], Res) ->
+     case Res of
+        {error, _} -> not Correct;
+        ok -> Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_low},
+          {error, insufficient_funds}}} -> not Correct;
+        {'EXIT',
+         {different, {error, account_nonce_too_high},
+          {error, insufficient_funds}}} -> not Correct;
+        _ -> false
+    end.
+
+query_oracle_features(_S, [_Env, _, _, Tx, Correct], Res) ->
+    [{correct, if Correct -> query_oracle; true -> false end} ] ++
+             [ {query_query_fee, zero} || maps:get(query_fee, Tx) == 0 andalso Correct] ++
+             [ {query_oracle, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
+        [{query_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
+
 
 %% -- Property ---------------------------------------------------------------
 prop_tx_primops() ->
@@ -316,7 +421,11 @@ bugs(Time, Bugs) ->
     more_bugs(eqc:testing_time(Time, prop_tx_primops()), 20, Bugs).
 
 
+
 %% --- local helpers ------
+
+correct_height(#{tx_env := TxEnv}, Env) ->
+    aetx_env:height(TxEnv) == aetx_env:height(Env).
 
 strict_equal(X, Y) ->
      case X == Y of 
@@ -363,5 +472,11 @@ unique_name(List) ->
          noshrink(?SUCHTHAT([Word], 
                             eqc_erlang_program:words(1), not lists:member(Word, List))), 
          W).
+
+gen_nonce(Account) ->
+    %% 0 is always wrong, 1 is often too low and 100 is often too high
+    frequency([{1, 0}, {1, 1}, {97, Account#account.nonce}, {1, 100}]).
+
+
 
 
