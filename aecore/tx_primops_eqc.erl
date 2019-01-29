@@ -403,12 +403,8 @@ query_oracle_features(_S, [_Env, _, _, Tx, Correct], Res) ->
 %% -- Property ---------------------------------------------------------------
 prop_tx_primops() ->
     ?FORALL(Cmds, commands(?MODULE),
-    ?TIMEOUT(3000,
     begin
-        %% io:format("Pinging ~p~n", [?REMOTE_NODE]),
-
         pong = net_adm:ping(?REMOTE_NODE),
-        %% io:format("Start run test ~p~n", [Cmds]),
 
         {H, S, Res} = run_commands(Cmds),
         Height = 
@@ -416,14 +412,14 @@ prop_tx_primops() ->
                 undefined -> 0;
                 TxEnv -> aetx_env:height(TxEnv)
             end,
-        %% io:format("Did run test"),
         check_command_names(Cmds,
             measure(length, commands_length(Cmds),
             measure(height, Height,
+            features(call_features(H),
             aggregate(call_features(H),
                 pretty_commands(?MODULE, Cmds, {H, S, Res},
-                                Res == ok)))))
-    end)).
+                                Res == ok))))))
+    end).
 
 bugs() -> bugs(10).
 
