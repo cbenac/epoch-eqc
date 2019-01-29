@@ -84,7 +84,15 @@ mine(Height) ->
     ok.
 
 mine_next(#{tx_env := TxEnv} = S, _Value, [H]) ->
-    S#{tx_env => aetx_env:set_height(TxEnv, H + 1)}.
+    Payback = [ {Sender, Height, Fee} || {Sender, Height, Fee} <- maps:get(queries, S, []), Height =< H],
+    Accounts = [ case lists:keyfind(Account#account.key, 1, Payback) of
+                     false -> Account;
+                     {_, _, Fee} -> Account#account{amount = Account#account.amount + Fee}
+                 end || Account <- maps:get(accounts, S, [])],
+    S#{tx_env => aetx_env:set_height(TxEnv, H + 1),
+       accounts => Accounts,
+       queries =>  maps:get(queries, S, []) -- Payback
+      }.
 
 %% --- Operation: spend ---
 spend_pre(S) ->
@@ -357,13 +365,17 @@ query_oracle(Env, _Sender, _Oracle, Tx, _Correct) ->
         Other -> Other
     end.
 
-query_oracle_next(#{accounts := Accounts} = S, _Value, [_Env, {_, Sender}, _Oracle, Tx, Correct]) ->
+query_oracle_next(#{accounts := Accounts} = S, _Value, [Env, {_, Sender}, _Oracle, Tx, Correct]) ->
     if Correct ->
+            {delta, Delta} = maps:get(response_ttl, Tx),
             SAccount = lists:keyfind(Sender, #account.key, Accounts),
             S#{accounts => 
                    (Accounts -- [SAccount]) ++
-                   [SAccount#account{amount = SAccount#account.amount - maps:get(fee, Tx) - maps:get(query_fee, Tx), 
-                                     nonce = maps:get(nonce, Tx) + 1}]};
+                   [SAccount#account{
+                      amount = SAccount#account.amount - maps:get(fee, Tx) - maps:get(query_fee, Tx), 
+                      nonce = maps:get(nonce, Tx) + 1}],
+              queries => maps:get(queries, S, []) ++
+                   [{Sender, Delta + aetx_env:height(Env), maps:get(query_fee, Tx)}]};
        not Correct -> 
             S
     end.
