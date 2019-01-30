@@ -20,6 +20,7 @@
 
 -record(account, {key, amount, nonce}).
 -record(query, {sender, id, fee, response_ttl}).
+-record(channel, {id}).
 
 %% -- State and state functions ----------------------------------------------
 initial_state() ->
@@ -291,8 +292,7 @@ register_oracle_post(_S, [_Env, _Sender,_Tx, Correct], Res) ->
 
 register_oracle_features(_S, [_Env, {_, _Sender}, Tx, Correct], Res) ->
     [{correct, if Correct -> register_oracle; true -> false end} ] ++
-             [ {oracle_query_fee, zero} || maps:get(query_fee, Tx) == 0 andalso Correct] ++
-             [ {oracle, zero_fee} ||  maps:get(fee, Tx) == 0 ] ++
+        [ {oracle_query_fee, zero} || maps:get(query_fee, Tx) == 0 andalso Correct] ++
         [{register_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
 
@@ -427,6 +427,13 @@ response_oracle_valid(S, [_Env, {_, _, Oracle} = QueryId, Tx]) ->
                 Query =/= false
     end.
 
+response_oracle_adapt(#{tx_env := TxEnv} = S, [_, QueryId, Tx, _Correct]) ->
+    [TxEnv, QueryId, Tx, register_oracle_valid(S, [TxEnv, QueryId, Tx])];
+response_oracle_adapt(_, _) ->
+    %% in case we don't even have a TxEnv
+    false.
+
+
 response_oracle(Env, _QueryId, Tx, _Correct) ->
     Trees = get(trees),
     {ok, AeTx} = rpc(aeo_response_tx, new, [Tx]),
@@ -451,11 +458,10 @@ response_oracle(Env, _QueryId, Tx, _Correct) ->
 
 response_oracle_next(#{accounts := Accounts} = S, _Value, [_Env, QueryId, Tx, Correct]) ->
     if Correct ->
-            {_, _, Oracle} = QueryId, 
+            {_, _, Oracle} = QueryId,
             OracleAccount = lists:keyfind(Oracle, #account.key, Accounts),
             Query = lists:keyfind(QueryId, #query.id, maps:get(queries, S, [])),
             QueryFee = Query#query.fee,
-            {delta, Delta} = maps:get(response_ttl, Tx),
 
             S#{accounts => 
                    (Accounts -- [OracleAccount]) ++
