@@ -484,6 +484,101 @@ response_oracle_features(_S, [_Env, _, _Tx, Correct], Res) ->
     [{correct, if Correct -> response_oracle; true -> false end} ] ++
         [{response_oracle, Res} || is_tuple(Res) andalso element(1, Res) == error].
 
+%% --- Operation: channel_create ---
+channel_create_pre(S) ->
+    length(maps:get(accounts, S, [])) > 1.
+
+channel_create_args(#{accounts := Accounts, tx_env := Env} = S) ->
+    ?LET(Args, 
+         ?LET([{_, Initiator}, {_, Responder}],
+              vector(2, gen_account_pubkey(Accounts)),
+              [Env, Initiator#account.key, Responder#account.key,
+                    #{initiator_id => aec_id:create(account, Initiator#account.key),
+                      responder_id => aec_id:create(account, Responder#account.key),
+                      state_hash => <<1:256>>,
+                      initiator_amount => nat(),
+                      responder_amount => nat(),
+                      push_amount => nat(),
+                      lock_period => choose(0,2),
+                      channel_reserve => choose(0,10),
+                      fee => choose(1, 10), 
+                      nonce => gen_nonce(Initiator)}]),
+         Args ++ [channel_create_valid(S, Args)]).
+
+channel_create_pre(S, [Env, Initiator, Responder, Tx, Correct]) ->
+    Correct == channel_create_valid(S, [Env, Initiator, Responder, Tx]) 
+        andalso correct_height(S, Env).
+
+channel_create_valid(S, [_Env, Initiator, Responder, Tx]) ->
+   case {lists:keyfind(Initiator, #account.key, maps:get(accounts, S, [])),
+         lists:keyfind(Responder, #account.key, maps:get(accounts, S, []))} of
+        {false, _} -> false;
+        {_, false} -> false;
+        {IAccount, RAccount} ->
+            IAccount#account.nonce == maps:get(nonce, Tx) andalso
+               IAccount#account.amount >= maps:get(fee, Tx) + maps:get(initiator_amount, Tx) andalso
+               RAccount#account.amount >= maps:get(responder_amount, Tx) andalso
+               maps:get(initiator_amount, Tx) >= maps:get(channel_reserve, Tx) andalso
+               maps:get(responder_amount, Tx) >= maps:get(channel_reserve, Tx) 
+    end.
+
+channel_create_adapt(#{tx_env := TxEnv} = S, [_, Initiator, Responder, Tx, _Correct]) ->
+    [TxEnv, Initiator, Responder, Tx, channel_create_valid(S, [TxEnv, Initiator, Responder, Tx])];
+channel_create_adapt(_, _) ->
+    %% in case we don't even have a TxEnv
+    false.
+
+
+channel_create(Env, _Initiator, _Responder, Tx, _Correct) ->
+    Trees = get(trees),
+    {ok, AeTx} = rpc(aesc_create_tx, new, [Tx]),
+    {channel_create_tx, ChannelTx} = aetx:specialize_type(AeTx),
+    
+    %% old version
+    Remote = 
+        case rpc:call(?REMOTE_NODE,aesc_create_tx, check, [ChannelTx, Trees, Env], 1000) of
+            {ok, Ts} ->
+                rpc:call(?REMOTE_NODE, aesc_create_tx, process, [ChannelTx, Ts, Env], 1000);
+            OldError ->
+                OldError
+        end,
+
+    Local = rpc:call(node(), aesc_create_tx, process, [ChannelTx, Trees, Env], 1000),
+    case catch eq_rpc(Local, Remote, fun hash_equal/2) of
+        {ok, NewTrees} ->
+            put(trees, NewTrees),
+            ok;
+        Other -> Other
+    end.
+
+channel_create_next(#{accounts := Accounts} = S, _Value, [_Env, Initiator, Responder, Tx, Correct]) ->
+    if Correct ->
+            IAccount = lists:keyfind(Initiator, #account.key, Accounts),
+            RAccount = lists:keyfind(Responder, #account.key, Accounts),
+            S#{accounts => 
+                   (Accounts -- [IAccount, RAccount]) ++
+                   [IAccount#account{amount = 
+                                         IAccount#account.amount - 
+                                         maps:get(fee, Tx) - 
+                                         maps:get(initiator_amount, Tx), 
+                                     nonce = maps:get(nonce, Tx) + 1},
+                   RAccount#account{amount = 
+                                        RAccount#account.amount - 
+                                        maps:get(responder_amount, Tx)}],
+               channels =>
+                   maps:get(channels, S, []) ++ [#channel{id = {Initiator, maps:get(nonce, Tx), Responder}}]};
+       not Correct ->
+            S
+    end.
+
+channel_create_post(_S, [_Env, _Initiator, _Responder, _Tx, Correct], Res) ->
+    case Res of
+        {error, _} -> not Correct;
+        ok -> Correct;
+        _ -> not Correct andalso valid_mismatch(Res)
+    end.
+
+
 
 %% -- Property ---------------------------------------------------------------
 prop_tx_primops() ->
